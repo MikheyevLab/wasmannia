@@ -1,0 +1,95 @@
+---
+title: "Caste biased selection in Wasmannia"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+library(tidyverse)
+library(edgeR)
+library(qvalue)
+```
+
+
+Load data on expression and selection
+```{r}
+snipre <- read_csv("data/snipre.csv")
+mkt <- read_csv("data/mkt.csv")
+counts <- read_csv("data/rsem.csv") %>% group_by(gene_id) %>%  filter(mean(fpkm) >= 1) %>% select(library, gene_id, count) %>% spread(key = library, value = count)
+taxOrder <- c("Metazoa", "Arthropoda",  "Insecta", "Endopterygota", "Hymenoptera", "Aculeata", "Formicidae")
+max_level <- function(taxList) {
+  # given a list of taxonomic categories, choose oldest one. Used to find oldest level of gene from orthodb
+  minOrder <- length(taxOrder) + 1
+  for (i in taxList) {
+    taxMatch <- grep(i, taxOrder)
+    if (taxMatch < minOrder) minOrder <- taxMatch
+  }
+    return(minOrder)
+}
+orthodb <- read_csv("data/orthodb.csv") %>% group_by(gene_id) %>% summarise(oldestLevel = max_level(level)) # this data frame now holds the oldest known level for each gene, with older levels having lower numbers
+```
+
+Gene expression analysis
+```{r}
+caste <- data.frame(lib = colnames(counts)[-1]) %>% filter(lib!="b") %>% mutate(caste = ifelse(grepl("q",lib,ignore.case = T),"Q",ifelse(grepl("w",lib,ignore.case=T),"W","M"))) 
+design <- model.matrix(~ caste + 0, caste)
+rownames(design) <- caste$lib
+
+#glm
+dge <- DGEList(round(counts[,rownames(design)]))
+dge <- calcNormFactors(dge)
+dat <- estimateGLMCommonDisp(dge, design)
+dat <- estimateGLMTrendedDisp(dat, design)
+dat <- estimateGLMTagwiseDisp(dat, design)
+fit <- glmQLFit(dat,design)
+
+plotMDS(dat)
+
+QvsW <- glmQLFTest(fit, contrast=c(0,-1,1)) # negative values are upregulated in queens
+QvsW$table$qvalue <- qvalue(QvsW$table$PValue)$qvalues
+QvsW$table$gene_id <- counts$gene_id
+table(QvsW$table$qvalue<0.05)
+
+# identify genes differentailly expressed between males and queens
+MvsQ <- glmQLFTest(fit, contrast=c(-1,1,0)) # negative in males
+MvsQ$table$qvalue <- qvalue(MvsQ$table$PValue)$qvalues
+MvsQ$table$gene_id <- counts$gene_id
+table(MvsQ$table$qvalue<0.05)
+
+# subtract genes that are different between males and queens from those in workers to identify diffrences between reproductive and non-reproductives
+RvsW <- glmQLFTest(fit, contrast=c(-0.5,-0.5,1)) # reproductives are negative
+RvsW$table$gene_id <- counts$gene_id
+RvsW$tableWvsR <- RvsW$table %>% filter(gene_id %in% filter(MvsQ$table, qvalue >= 0.05)$gene_id) %>% mutate(qvalue = qvalue(PValue)$qvalues) 
+table(RvsW$tableWvsR$qvalue<0.05)
+```
+
+
+```{r}
+QvsWsig <- left_join(QvsW$table, mkt, by = "gene_id") %>% left_join(., snipre, by = "gene_id") %>% mutate(caste = ifelse(logFC<0 & qvalue < 0.05,"Q",ifelse(logFC>0 & qvalue < 0.05, "W", "NDE"))) %>% left_join(orthodb)
+
+QvsWsig %>% group_by(caste)  %>% summarize( mean_gamma = mean(gamma, na.rm = T), mean_alpha =  mean(alpha, na.rm = T), mean_rest = mean(Rest, na.rm = T), mean_f = mean(f, na.rm = T))
+QvsWsig %>% group_by(caste) %>% na.omit() %>% filter(alpha>=0) %>% summarize(  mean_alpha =  mean(alpha, na.rm = T))
+
+# newest genes only
+QvsWsig %>% group_by(caste) %>% filter(is.na(oldestLevel)) %>% summarize( mean_gamma = mean(gamma, na.rm = T), mean_alpha =  mean(alpha, na.rm = T), mean_rest = mean(Rest, na.rm = T), mean_f = mean(f, na.rm = T))
+
+# overall
+QvsWsig %>% group_by(caste) %>% summarize( mean_gamma = mean(gamma), mean_alpha =  mean(alpha), mean_rest = mean(Rest), mean_f = mean(f))
+
+with(QvsWsig %>% filter(alpha>=0), cor.test(logFC, alpha, method="s"))
+with(QvsWsig, cor.test(logFC, gamma, method="s"))
+
+
+ggplot(QvsWsig %>% mutate(oldest = ifelse(is.na(oldestLevel),8,oldestLevel)), aes(caste, oldest))+stat_summary(fun.data = mean_cl_boot, geom = "errorbar", width = 0.2)
+```
+
+## QvsW descriptive plots
+```{r}
+kruskal.test(alpha ~ as.factor(caste), data=QvsWsig)
+ggplot(QvsWsig, aes(as.factor(caste), alpha)) + geom_boxplot()
+kruskal.test(f ~ as.factor(caste), data=QvsWsig)
+kruskal.test(gamma ~ as.factor(caste), data=QvsWsig)
+kruskal.test(Rest ~ as.factor(caste), data=QvsWsig)
+```
